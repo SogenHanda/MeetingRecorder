@@ -1,0 +1,195 @@
+import AVFoundation
+import AppKit
+import CoreGraphics
+import Foundation
+
+@MainActor
+final class AppModel: ObservableObject {
+    @Published var sessions: [MeetingSession] = []
+    @Published var microphones: [MicrophoneDevice] = []
+    @Published var selectedMicrophoneID = ""
+    @Published var selectedSessionID: UUID?
+    @Published var meetingTitle = ""
+    @Published var captureSystemAudio = true
+    @Published var isRecording = false
+    @Published var isProcessing = false
+    @Published var status = "待機中"
+    @Published var errorMessage: String?
+    @Published var needsScreenRecordingPermission = false
+    @Published var elapsed: TimeInterval = 0
+
+    @Published var whisperModel: String {
+        didSet { UserDefaults.standard.set(whisperModel, forKey: "whisperModel") }
+    }
+    @Published var ollamaModel: String {
+        didSet { UserDefaults.standard.set(ollamaModel, forKey: "ollamaModel") }
+    }
+    @Published var huggingFaceToken: String {
+        didSet { KeychainStore.save(huggingFaceToken, account: "pyannote-token") }
+    }
+
+    private let store = SessionStore()
+    private let microphoneCapture = MicrophoneCapture()
+    private let systemCapture = SystemAudioCapture()
+    private var activeDirectory: URL?
+    private var activeManifest: MeetingManifest?
+    private var activeLedger: ActiveSessionLedger?
+    private var timer: Timer?
+
+    init() {
+        whisperModel = UserDefaults.standard.string(forKey: "whisperModel") ?? "small"
+        ollamaModel = UserDefaults.standard.string(forKey: "ollamaModel") ?? "qwen3:4b-instruct"
+        huggingFaceToken = KeychainStore.load(account: "pyannote-token") ?? ""
+        refreshDevices()
+        refreshSessions()
+    }
+
+    var selectedSession: MeetingSession? {
+        sessions.first { $0.id == selectedSessionID }
+    }
+
+    func refreshDevices() {
+        microphones = MicrophoneCapture.devices()
+        if !microphones.contains(where: { $0.id == selectedMicrophoneID }) {
+            selectedMicrophoneID = microphones.first?.id ?? ""
+        }
+    }
+
+    func refreshSessions() {
+        sessions = store.loadAll()
+        if selectedSessionID == nil { selectedSessionID = sessions.first?.id }
+    }
+
+    func startRecording() async {
+        guard !isRecording, let microphone = microphones.first(where: { $0.id == selectedMicrophoneID }) else {
+            errorMessage = "使用するマイクを選択してください"
+            return
+        }
+
+        let permission = await AVCaptureDevice.requestAccess(for: .audio)
+        guard permission else {
+            errorMessage = "システム設定でマイクへのアクセスを許可してください"
+            return
+        }
+
+        if captureSystemAudio && !CGPreflightScreenCaptureAccess() {
+            guard CGRequestScreenCaptureAccess() else {
+                needsScreenRecordingPermission = true
+                errorMessage = "システム設定の「プライバシーとセキュリティ」→「画面とシステムオーディオの録音」でMeeting Recorderを許可し、アプリを開き直してください。"
+                return
+            }
+        }
+
+        do {
+            let (directory, manifest) = try store.createSession(
+                title: meetingTitle,
+                microphoneName: microphone.name,
+                capturesSystemAudio: captureSystemAudio
+            )
+            activeDirectory = directory
+            activeManifest = manifest
+            let ledger = ActiveSessionLedger(store: store, directory: directory, manifest: manifest)
+            activeLedger = ledger
+
+            let callback: ChunkedAudioWriter.Completion = { [ledger] chunk in
+                ledger.add(chunk)
+            }
+            let micWriter = ChunkedAudioWriter(
+                source: .microphone,
+                directory: directory.appendingPathComponent("audio"),
+                sessionStartedAt: manifest.startedAt,
+                onChunkCompleted: callback
+            )
+            try microphoneCapture.start(deviceID: microphone.id, writer: micWriter)
+
+            if captureSystemAudio {
+                let systemWriter = ChunkedAudioWriter(
+                    source: .system,
+                    directory: directory.appendingPathComponent("audio"),
+                    sessionStartedAt: manifest.startedAt,
+                    onChunkCompleted: callback
+                )
+                do {
+                    try await systemCapture.start(writer: systemWriter)
+                } catch {
+                    await microphoneCapture.stop()
+                    throw error
+                }
+            }
+
+            isRecording = true
+            status = "録音中"
+            elapsed = 0
+            timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, let started = self.activeManifest?.startedAt else { return }
+                    self.elapsed = Date().timeIntervalSince(started)
+                }
+            }
+        } catch {
+            if captureSystemAudio && !CGPreflightScreenCaptureAccess() {
+                needsScreenRecordingPermission = true
+                errorMessage = "システム設定の「プライバシーとセキュリティ」→「画面とシステムオーディオの録音」でMeeting Recorderを許可し、アプリを開き直してください。"
+            } else {
+                errorMessage = error.localizedDescription
+            }
+            activeDirectory = nil
+            activeManifest = nil
+            activeLedger = nil
+            status = "録音を開始できませんでした"
+        }
+    }
+
+    func stopRecording() async {
+        guard isRecording else { return }
+        status = "録音を保存中"
+        timer?.invalidate()
+        timer = nil
+        await microphoneCapture.stop()
+        if captureSystemAudio { await systemCapture.stop() }
+
+        if let ledger = activeLedger { activeManifest = ledger.finalize() }
+        isRecording = false
+        activeDirectory = nil
+        activeManifest = nil
+        activeLedger = nil
+        status = "保存しました"
+        meetingTitle = ""
+        refreshSessions()
+    }
+
+    func processSelectedSession() async {
+        guard let session = selectedSession, !isProcessing else { return }
+        isProcessing = true
+        status = "文字起こし・話者分類中"
+        do {
+            _ = try await ProcessingRunner.run(
+                sessionDirectory: session.directory,
+                whisperModel: whisperModel,
+                ollamaModel: ollamaModel,
+                huggingFaceToken: huggingFaceToken
+            )
+            status = "議事録を作成しました"
+        } catch {
+            errorMessage = error.localizedDescription
+            status = "処理に失敗しました"
+        }
+        isProcessing = false
+    }
+
+    func revealSelectedSession() {
+        guard let session = selectedSession else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([session.directory])
+    }
+
+    func open(_ url: URL) { NSWorkspace.shared.open(url) }
+
+    func openScreenRecordingSettings() {
+        needsScreenRecordingPermission = false
+        errorMessage = nil
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+}
