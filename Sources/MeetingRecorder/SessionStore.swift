@@ -53,6 +53,17 @@ final class SessionStore {
         }
     }
 
+    func rename(_ session: MeetingSession, to title: String) throws {
+        var manifest = session.manifest
+        manifest.title = title
+        try save(manifest, in: session.directory)
+    }
+
+    func moveToTrash(_ session: MeetingSession) throws {
+        var resultingURL: NSURL?
+        try FileManager.default.trashItem(at: session.directory, resultingItemURL: &resultingURL)
+    }
+
     func loadAll() -> [MeetingSession] {
         let directories = (try? FileManager.default.contentsOfDirectory(
             at: root,

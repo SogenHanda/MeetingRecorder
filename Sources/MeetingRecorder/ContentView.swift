@@ -14,6 +14,11 @@ struct ContentView: View {
                 }
                 .tag(session.id)
                 .padding(.vertical, 3)
+                .contextMenu {
+                    Button("名前を変更") { model.prepareRename(session) }
+                    Divider()
+                    Button("削除", role: .destructive) { model.prepareDelete(session) }
+                }
             }
             .navigationTitle("ミーティング")
             .toolbar {
@@ -42,6 +47,29 @@ struct ContentView: View {
             Button("OK", role: .cancel) { model.errorMessage = nil }
         } message: {
             Text(model.errorMessage ?? "")
+        }
+        .sheet(isPresented: $model.isRenamePresented) {
+            VStack(alignment: .leading, spacing: 18) {
+                Text("録音の名前を変更").font(.title2.bold())
+                TextField("録音名", text: $model.renameTitle)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { _ = model.saveRename() }
+                HStack {
+                    Spacer()
+                    Button("キャンセル", role: .cancel) { model.isRenamePresented = false }
+                    Button("保存") { _ = model.saveRename() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.renameTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .padding(24)
+            .frame(width: 420)
+        }
+        .alert("録音を削除しますか？", isPresented: $model.isDeleteConfirmationPresented) {
+            Button("ゴミ箱へ移動", role: .destructive) { model.deletePreparedSession() }
+            Button("キャンセル", role: .cancel) { }
+        } message: {
+            Text("「\(model.pendingDeleteSession?.manifest.title ?? "選択した録音")」と、その音声・文字起こし・議事録をゴミ箱へ移動します。")
         }
     }
 
@@ -102,7 +130,17 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
+                    Button {
+                        model.prepareRename(session)
+                    } label: {
+                        Label("名前を変更", systemImage: "pencil")
+                    }
                     Button("Finderで表示", action: model.revealSelectedSession)
+                    Button(role: .destructive) {
+                        model.prepareDelete(session)
+                    } label: {
+                        Label("削除", systemImage: "trash")
+                    }
                 }
 
                 Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 8) {

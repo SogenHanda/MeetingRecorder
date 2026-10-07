@@ -9,6 +9,7 @@ macOS上でマイクとシステム音声をローカル録音し、多言語文
 - ScreenCaptureKitでシステム音声を直接取得。Zoomや既定の出力デバイス設定は変更しません。
 - 任意のマイクをAVCaptureDeviceから直接選択。システムの既定入力は変更しません。
 - 音声を5分単位のM4Aへ分割し、録音中も`session.json`を更新します。
+- 録音項目の名前変更と、macOSのゴミ箱へ移動する安全な削除。
 - faster-whisperによる多言語文字起こし。
 - pyannote.audioによる声ベースの話者A/B/C分類。
 - Ollamaと`qwen3:4b-instruct`による、完全ローカルの構造化議事録生成。

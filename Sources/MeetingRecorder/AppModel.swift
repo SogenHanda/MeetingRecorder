@@ -17,6 +17,12 @@ final class AppModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var needsScreenRecordingPermission = false
     @Published var elapsed: TimeInterval = 0
+    @Published var isRenamePresented = false
+    @Published var isDeleteConfirmationPresented = false
+    @Published var renameTitle = ""
+
+    private var pendingRenameSessionID: UUID?
+    private var pendingDeleteSessionID: UUID?
 
     @Published var whisperModel: String {
         didSet { UserDefaults.standard.set(whisperModel, forKey: "whisperModel") }
@@ -46,6 +52,10 @@ final class AppModel: ObservableObject {
 
     var selectedSession: MeetingSession? {
         sessions.first { $0.id == selectedSessionID }
+    }
+
+    var pendingDeleteSession: MeetingSession? {
+        sessions.first { $0.id == pendingDeleteSessionID }
     }
 
     func refreshDevices() {
@@ -183,6 +193,61 @@ final class AppModel: ObservableObject {
     }
 
     func open(_ url: URL) { NSWorkspace.shared.open(url) }
+
+    func prepareRename(_ session: MeetingSession) {
+        pendingRenameSessionID = session.id
+        renameTitle = session.manifest.title
+        isRenamePresented = true
+    }
+
+    @discardableResult
+    func saveRename() -> Bool {
+        let title = renameTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else {
+            errorMessage = "名前を入力してください"
+            return false
+        }
+        guard let id = pendingRenameSessionID,
+              let session = sessions.first(where: { $0.id == id }) else {
+            errorMessage = "編集する録音が見つかりません"
+            return false
+        }
+        do {
+            try store.rename(session, to: title)
+            refreshSessions()
+            selectedSessionID = id
+            pendingRenameSessionID = nil
+            isRenamePresented = false
+            status = "名前を変更しました"
+            return true
+        } catch {
+            errorMessage = "名前を変更できませんでした: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func prepareDelete(_ session: MeetingSession) {
+        pendingDeleteSessionID = session.id
+        isDeleteConfirmationPresented = true
+    }
+
+    func deletePreparedSession() {
+        guard let session = pendingDeleteSession else {
+            isDeleteConfirmationPresented = false
+            return
+        }
+        do {
+            try store.moveToTrash(session)
+            if selectedSessionID == session.id { selectedSessionID = nil }
+            pendingDeleteSessionID = nil
+            isDeleteConfirmationPresented = false
+            refreshSessions()
+            status = "録音をゴミ箱へ移動しました"
+        } catch {
+            errorMessage = "録音を削除できませんでした: \(error.localizedDescription)"
+            isDeleteConfirmationPresented = false
+        }
+    }
 
     func openScreenRecordingSettings() {
         needsScreenRecordingPermission = false
