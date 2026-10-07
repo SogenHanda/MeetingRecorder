@@ -44,7 +44,7 @@ final class AppModel: ObservableObject {
 
     init() {
         whisperModel = UserDefaults.standard.string(forKey: "whisperModel") ?? "small"
-        ollamaModel = UserDefaults.standard.string(forKey: "ollamaModel") ?? "qwen3:4b-instruct"
+        ollamaModel = UserDefaults.standard.string(forKey: "ollamaModel") ?? "qwen3.5:9b"
         huggingFaceToken = KeychainStore.load(account: "pyannote-token") ?? ""
         refreshDevices()
         refreshSessions()

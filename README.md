@@ -12,7 +12,7 @@ macOS上でマイクとシステム音声をローカル録音し、多言語文
 - 録音項目の名前変更と、macOSのゴミ箱へ移動する安全な削除。
 - faster-whisperによる多言語文字起こし。
 - pyannote.audioによる声ベースの話者A/B/C分類。
-- Ollamaと`qwen3:4b-instruct`による、完全ローカルの構造化議事録生成。
+- Ollamaと`qwen3.5:9b`による、完全ローカルの構造化議事録生成。長いログは分割して事実を抽出し、最後に統合します。
 - 録音・文字起こし・要約データはすべてMac内へ保存し、外部サービスへ送信しません。
 
 ## 必要環境
@@ -21,7 +21,7 @@ macOS上でマイクとシステム音声をローカル録音し、多言語文
 - Xcode 16またはSwift 6
 - ffmpeg
 - Python 3.10〜3.13（音声処理用。Python 3.12推奨）
-- Ollamaと`qwen3:4b-instruct`（要約用）
+- Ollamaと`qwen3.5:9b`（要約用、約7GBの空き容量を推奨）
 - 話者分類にはHugging Faceで`pyannote/speaker-diarization-community-1`の利用条件への同意とアクセストークンが必要です。
 
 ## セットアップ
@@ -29,7 +29,7 @@ macOS上でマイクとシステム音声をローカル録音し、多言語文
 ```zsh
 brew install ffmpeg python@3.12 ollama
 brew services start ollama
-ollama pull qwen3:4b-instruct
+ollama pull qwen3.5:9b
 ./setup_runtime.sh
 ./build_app.sh
 open 'dist/Meeting Recorder.app'
@@ -46,7 +46,7 @@ ollama list
 curl http://127.0.0.1:11434/api/version
 ```
 
-`qwen3:4b-instruct`以外を使う場合は、アプリの「設定」でモデル名を変更してください。指定モデルが見つからない場合は、インストール済みの対応モデルを自動選択します。
+`qwen3.5:9b`以外を使う場合は、アプリの「設定」でモデル名を変更してください。指定モデルが見つからない場合は、インストール済みの対応モデルを自動選択します。
 
 ## 保存場所
 

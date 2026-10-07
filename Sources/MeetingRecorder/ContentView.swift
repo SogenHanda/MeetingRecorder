@@ -199,7 +199,7 @@ struct SettingsView: View {
             Text("例: small / medium / large-v3。初回のみモデルがダウンロードされます。")
                 .font(.caption).foregroundStyle(.secondary)
             TextField("Ollamaモデル", text: $model.ollamaModel)
-            Text("推奨: qwen3:4b-instruct。Ollama未起動やモデル未導入の場合は、簡易要約へ落とさずエラーを表示します。")
+            Text("推奨: qwen3.5:9b。長い会議は全ログを分割して事実を抽出し、最後に統合します。Ollama未起動やモデル未導入の場合はエラーを表示します。")
                 .font(.caption).foregroundStyle(.secondary)
             SecureField("Hugging Faceトークン（話者分類用）", text: $model.huggingFaceToken)
             Text("pyannoteの話者分類に使用します。値はmacOSキーチェーンへ保存されます。")

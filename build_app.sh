@@ -23,8 +23,8 @@ cat > "$contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Meeting Recorder</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.3</string>
-  <key>CFBundleVersion</key><string>4</string>
+  <key>CFBundleShortVersionString</key><string>0.1.4</string>
+  <key>CFBundleVersion</key><string>5</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSMicrophoneUsageDescription</key><string>会議の音声を録音して議事録を作成するためにマイクを使用します。</string>
   <key>NSScreenCaptureUsageDescription</key><string>Zoomなどのシステム音声を録音するために画面収録の権限を使用します。映像は保存しません。</string>
