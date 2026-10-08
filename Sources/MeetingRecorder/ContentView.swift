@@ -16,8 +16,10 @@ struct ContentView: View {
                 .padding(.vertical, 3)
                 .contextMenu {
                     Button("名前を変更") { model.prepareRename(session) }
+                        .disabled(model.isProcessing || model.isRecording)
                     Divider()
                     Button("削除", role: .destructive) { model.prepareDelete(session) }
+                        .disabled(model.isProcessing || model.isRecording)
                 }
             }
             .navigationTitle("ミーティング")
@@ -135,12 +137,14 @@ struct ContentView: View {
                     } label: {
                         Label("名前を変更", systemImage: "pencil")
                     }
+                    .disabled(model.isProcessing || model.isRecording)
                     Button("Finderで表示", action: model.revealSelectedSession)
                     Button(role: .destructive) {
                         model.prepareDelete(session)
                     } label: {
                         Label("削除", systemImage: "trash")
                     }
+                    .disabled(model.isProcessing || model.isRecording)
                 }
 
                 Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 8) {
@@ -160,9 +164,14 @@ struct ContentView: View {
                         if model.isProcessing { ProgressView().controlSize(.small) } else { Label("議事録を作成", systemImage: "text.bubble") }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(model.isProcessing || session.manifest.chunks.isEmpty)
+                    .disabled(model.isProcessing || model.isRecording || session.manifest.chunks.isEmpty)
 
                     if FileManager.default.fileExists(atPath: session.transcriptURL.path) {
+                        Button("文字起こしをやり直す") {
+                            Task { await model.processSelectedSession(forceTranscription: true) }
+                        }
+                        .disabled(model.isProcessing || model.isRecording)
+                        .help("現在の設定で元音声から認識し直します。以前のログと議事録はhistoryフォルダへ保存します。")
                         Button("全文ログを開く") { model.open(session.transcriptURL) }
                     }
                     if FileManager.default.fileExists(atPath: session.summaryURL.path) {
@@ -200,7 +209,33 @@ struct SettingsView: View {
     var body: some View {
         Form {
             TextField("Whisperモデル", text: $model.whisperModel)
-            Text("例: small / medium / large-v3。初回のみモデルがダウンロードされます。")
+            Text("精度優先: large-v3。速度とのバランス: large-v3-turbo。初回はモデルをダウンロードします。")
+                .font(.caption).foregroundStyle(.secondary)
+            Picker("会話の言語", selection: Binding(
+                get: { ["ja", "auto", "en", "zh", "ko"].contains(model.transcriptionLanguage) ? model.transcriptionLanguage : "custom" },
+                set: { model.transcriptionLanguage = $0 == "custom" ? "fr" : $0 }
+            )) {
+                Text("日本語").tag("ja")
+                Text("自動検出（多言語）").tag("auto")
+                Text("英語").tag("en")
+                Text("中国語").tag("zh")
+                Text("韓国語").tag("ko")
+                Text("その他の言語コードを指定").tag("custom")
+            }
+            if !["ja", "auto", "en", "zh", "ko"].contains(model.transcriptionLanguage) {
+                TextField("言語コード（例: fr / de / es）", text: $model.transcriptionLanguage)
+            }
+            TextField("専門用語・人名のヒント", text: $model.transcriptionVocabulary, axis: .vertical)
+                .lineLimit(2...3)
+            Text("会議で使う正しい表記を入力します。例: IAMAS、メディアアート、生成AI、openFrameworks。")
+                .font(.caption).foregroundStyle(.secondary)
+            Picker("文字起こしに使う音声", selection: $model.transcriptionAudioSource) {
+                Text("マイク・システム音声を別々に認識（推奨）").tag("separate")
+                Text("マイクのみ").tag("microphone")
+                Text("システム音声のみ").tag("system")
+                Text("両方を混ぜて認識").tag("mixed")
+            }
+            Text("設定の変更を過去の録音へ適用するには「文字起こしをやり直す」を押します。以前のログは保存されます。")
                 .font(.caption).foregroundStyle(.secondary)
             TextField("Ollamaモデル", text: $model.ollamaModel)
             Text("推奨: qwen3.5:9b。長い会議は全ログを分割して事実を抽出し、最後に統合します。Ollama未起動やモデル未導入の場合はエラーを表示します。")

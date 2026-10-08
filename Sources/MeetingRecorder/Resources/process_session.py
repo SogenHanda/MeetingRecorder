@@ -12,7 +12,10 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+import wave
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 
 
@@ -22,6 +25,17 @@ class SpeechSegment:
     end: float
     text: str
     speaker: str = "SPEAKER_00"
+    audio_source: str = "mixed"
+    avg_logprob: float | None = None
+    no_speech_prob: float | None = None
+
+
+def progress(message: str) -> None:
+    print(f"PROGRESS: {message}", file=sys.stderr, flush=True)
+
+
+def source_name(source: str) -> str:
+    return {"microphone": "マイク", "system": "システム音声", "mixed": "混合音声"}.get(source, source)
 
 
 def run(command: list[str]) -> None:
@@ -43,53 +57,156 @@ def find_ffmpeg() -> str:
     raise RuntimeError("ffmpegが見つかりません。Homebrewで `brew install ffmpeg` を実行してください。")
 
 
-def concat_source(session: Path, chunks: list[dict], source: str, destination: Path, ffmpeg: str) -> bool:
+def concat_source(session: Path, manifest: dict, source: str, destination: Path, ffmpeg: str) -> bool:
     selected = sorted(
-        (chunk for chunk in chunks if chunk["source"] == source),
+        (chunk for chunk in manifest["chunks"] if chunk["source"] == source),
         key=lambda chunk: chunk["startedAt"],
     )
-    files = [session / chunk["relativePath"] for chunk in selected]
-    files = [path for path in files if path.exists()]
-    if not files:
+    if not selected:
         return False
-    concat_file = destination.with_suffix(".concat.txt")
-    concat_file.write_text("".join(f"file '{str(path).replace(chr(39), chr(39) * 2)}'\n" for path in files), encoding="utf-8")
-    run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-ar", "16000", "-ac", "1", str(destination)])
-    concat_file.unlink(missing_ok=True)
+    started_at = datetime.fromisoformat(manifest["startedAt"].replace("Z", "+00:00"))
+    frames_written = 0
+    # Decode one five-minute file at a time. Memory use stays bounded for long meetings.
+    with wave.open(str(destination), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16000)
+        for index, chunk in enumerate(selected, start=1):
+            path = session / chunk["relativePath"]
+            if not path.is_file():
+                raise RuntimeError(f"元音声が見つかりません: {path.name}")
+            chunk_start = datetime.fromisoformat(chunk["startedAt"].replace("Z", "+00:00"))
+            target_frame = max(0, round((chunk_start - started_at).total_seconds() * 16000))
+            silence_frames = max(0, target_frame - frames_written)
+            while silence_frames:
+                count = min(silence_frames, 16000)
+                output.writeframesraw(bytes(count * 2))
+                frames_written += count
+                silence_frames -= count
+            progress(f"{source_name(source)}を準備中 {index}/{len(selected)}")
+            decoded = subprocess.run([
+                ffmpeg, "-v", "error", "-i", str(path), "-ar", "16000", "-ac", "1",
+                "-f", "s16le", "pipe:1",
+            ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+            output.writeframesraw(decoded)
+            frames_written += len(decoded) // 2
     return True
 
 
-def build_mix(session: Path, manifest: dict) -> Path:
+def build_audio_sources(session: Path, manifest: dict, audio_source: str) -> dict[str, Path]:
     ffmpeg = find_ffmpeg()
     work = session / ".processing"
     work.mkdir(exist_ok=True)
-    mic = work / "microphone.wav"
-    system = work / "system.wav"
-    has_mic = concat_source(session, manifest["chunks"], "microphone", mic, ffmpeg)
-    has_system = concat_source(session, manifest["chunks"], "system", system, ffmpeg)
-    if not has_mic and not has_system:
+    sources: dict[str, Path] = {}
+    for source in ("microphone", "system"):
+        if audio_source not in ("separate", "mixed", source):
+            continue
+        path = work / f"{source}.wav"
+        if concat_source(session, manifest, source, path, ffmpeg):
+            sources[source] = path
+    if not sources:
         raise RuntimeError("処理できる音声チャンクがありません。")
+    return sources
+
+
+def build_mix(session: Path, sources: dict[str, Path]) -> Path:
+    if len(sources) == 1:
+        return next(iter(sources.values()))
+    ffmpeg = find_ffmpeg()
+    work = session / ".processing"
     mixed = work / "mixed.wav"
-    if has_mic and has_system:
-        run([
-            ffmpeg, "-y", "-i", str(mic), "-i", str(system),
-            "-filter_complex", "amix=inputs=2:duration=longest:normalize=0",
-            "-ar", "16000", "-ac", "1", str(mixed),
-        ])
-    else:
-        shutil.copy2(mic if has_mic else system, mixed)
+    run([
+        ffmpeg, "-y", "-i", str(sources["microphone"]), "-i", str(sources["system"]),
+        "-filter_complex", "amix=inputs=2:duration=longest:normalize=1",
+        "-ar", "16000", "-ac", "1", str(mixed),
+    ])
     return mixed
 
 
-def transcribe(audio: Path, model_name: str) -> tuple[list[SpeechSegment], str]:
+def load_whisper_model(model_name: str):
     try:
         from faster_whisper import WhisperModel
+        from faster_whisper.utils import download_model
+        from huggingface_hub.errors import LocalEntryNotFoundError
     except ImportError as error:
         raise RuntimeError("音声処理ランタイムが未設定です。プロジェクト内の setup_runtime.sh を実行してください。") from error
-    model = WhisperModel(model_name, device="auto", compute_type="int8")
-    segments, info = model.transcribe(str(audio), beam_size=5, vad_filter=True, word_timestamps=False)
-    result = [SpeechSegment(float(item.start), float(item.end), item.text.strip()) for item in segments if item.text.strip()]
+    progress(f"文字起こしモデル {model_name} を読み込み中（初回はダウンロード）")
+    if Path(model_name).is_dir():
+        model_path = model_name
+    else:
+        try:
+            model_path = download_model(model_name, local_files_only=True)
+        except (LocalEntryNotFoundError, FileNotFoundError):
+            model_path = ""
+        if not model_path or not (Path(model_path) / "model.bin").is_file():
+            progress(f"モデル {model_name} を初回ダウンロード中")
+            model_path = download_model(model_name)
+    return WhisperModel(model_path, device="auto", compute_type="int8", cpu_threads=min(8, os.cpu_count() or 4))
+
+
+def transcribe(audio: Path, model, language: str, vocabulary: str, source: str) -> tuple[list[SpeechSegment], str]:
+    segments, info = model.transcribe(
+        str(audio), language=None if language == "auto" else language,
+        multilingual=language == "auto",
+        task="transcribe", beam_size=5, patience=1.2,
+        temperature=(0.0, 0.2, 0.4), vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 600, "speech_pad_ms": 400},
+        word_timestamps=True, hallucination_silence_threshold=2.0,
+        initial_prompt=vocabulary.strip() or None, hotwords=vocabulary.strip() or None,
+    )
+    result = []
+    last_reported = -30.0
+    for item in segments:
+        if item.text.strip():
+            result.append(SpeechSegment(
+                float(item.start), float(item.end), item.text.strip(),
+                audio_source=source, avg_logprob=float(item.avg_logprob),
+                no_speech_prob=float(item.no_speech_prob),
+            ))
+        if item.end - last_reported >= 30:
+            progress(f"{source_name(source)}を文字起こし中 {timestamp(item.end)} / {timestamp(info.duration)}")
+            last_reported = item.end
     return result, info.language or "unknown"
+
+
+def merge_sources(segments: list[SpeechSegment]) -> tuple[list[SpeechSegment], int]:
+    """Suppress only highly similar, overlapping cross-source echoes; keep raw source results."""
+    result: list[SpeechSegment] = []
+    active: list[SpeechSegment] = []
+    duplicates = 0
+    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
+        normalized = re.sub(r"[\W_]+", "", segment.text).lower()
+        duplicate = False
+        active = [previous for previous in active if previous.end >= segment.start]
+        for previous in reversed(active):
+            if previous.audio_source == segment.audio_source:
+                continue
+            overlap = min(previous.end, segment.end) - max(previous.start, segment.start)
+            minimum_duration = max(0.1, min(previous.end - previous.start, segment.end - segment.start))
+            if overlap / minimum_duration < 0.7:
+                continue
+            previous_text = re.sub(r"[\W_]+", "", previous.text).lower()
+            if len(normalized) >= 12 and SequenceMatcher(None, normalized, previous_text).ratio() >= 0.95:
+                duplicate = True
+                break
+        if duplicate:
+            duplicates += 1
+        else:
+            result.append(segment)
+            active.append(segment)
+    return result, duplicates
+
+
+def backup_outputs(session: Path) -> Path | None:
+    files = [session / name for name in ("transcript.md", "transcript.json", "transcript.sources.json", "transcription.json", "minutes.md")]
+    existing = [path for path in files if path.is_file()]
+    if not existing:
+        return None
+    history = session / "history" / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    history.mkdir(parents=True)
+    for path in existing:
+        shutil.copy2(path, history / path.name)
+    return history
 
 
 def diarize(audio: Path) -> list[tuple[float, float, str]]:
@@ -424,7 +541,7 @@ def extract_chunk_notes(title: str, chunk: str, index: int, total: int, model: s
 対象ログ:
 {chunk}
 """
-    print(f"要約用の事実抽出: {index}/{total}", file=sys.stderr, flush=True)
+    progress(f"要約用の事実抽出: {index}/{total}")
     return ollama_generate(model, prompt, num_predict=1600)
 
 
@@ -450,7 +567,7 @@ def verify_summary(title: str, evidence: str, draft: str, model: str) -> str:
 校正対象の議事録案:
 {draft}
 """
-    print("議事録を根拠ログと照合中", file=sys.stderr, flush=True)
+    progress("議事録を根拠ログと照合中")
     return ollama_generate(model, prompt, num_predict=3000)
 
 
@@ -514,7 +631,7 @@ def ollama_summary(title: str, transcript: str, requested_model: str) -> tuple[s
 全ログからの抽出結果と行動候補:
 {evidence}
     """
-    print("全ログの抽出結果を統合中", file=sys.stderr, flush=True)
+    progress("全ログの抽出結果を統合中")
     draft = ollama_generate(model, final_prompt, num_predict=3000)
     verified = verify_summary(title, evidence, draft, model)
     return ensure_explicit_actions(verified, explicit_actions), model
@@ -523,9 +640,15 @@ def ollama_summary(title: str, transcript: str, requested_model: str) -> tuple[s
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--session", required=True)
-    parser.add_argument("--model", default="small")
+    parser.add_argument("--model", default="large-v3")
     parser.add_argument("--ollama-model", default="")
-    parser.add_argument("--summary-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--summary-only", action="store_true")
+    mode.add_argument("--force-transcription", action="store_true")
+    parser.add_argument("--transcribe-only", action="store_true")
+    parser.add_argument("--language", default="ja")
+    parser.add_argument("--vocabulary", default="")
+    parser.add_argument("--audio-source", choices=("separate", "mixed", "microphone", "system"), default="separate")
     args = parser.parse_args()
 
     session = Path(args.session).resolve()
@@ -539,14 +662,48 @@ def main() -> int:
     if segments:
         transcript = plain_transcript(segments)
     else:
-        mixed = build_mix(session, manifest)
-        segments, language = transcribe(mixed, args.model)
-        apply_speakers(segments, diarize(mixed))
+        sources = build_audio_sources(session, manifest, args.audio_source)
+        model = load_whisper_model(args.model)
+        raw_segments: list[SpeechSegment] = []
+        languages: list[str] = []
+        inputs = {"mixed": build_mix(session, sources)} if args.audio_source == "mixed" else sources
+        for source, audio in inputs.items():
+            source_segments, detected_language = transcribe(audio, model, args.language, args.vocabulary, source)
+            raw_segments.extend(source_segments)
+            languages.append(detected_language)
+        del model
+        segments, duplicates = merge_sources(raw_segments)
+        progress("声ごとの話者を分類中")
+        turns = diarize(build_mix(session, sources)) if os.environ.get("PYANNOTE_TOKEN", "").strip() else []
+        apply_speakers(segments, turns)
+        language = ", ".join(dict.fromkeys(languages))
+        backup = backup_outputs(session)
+        if backup:
+            progress(f"以前のログと議事録を保存しました: {backup.name}")
         transcript = write_transcript(session, manifest, segments, language)
+        (session / "transcript.sources.json").write_text(
+            json.dumps([vars(item) for item in raw_segments], ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        metadata = {
+            "model": args.model, "requested_language": args.language,
+            "detected_languages": languages, "vocabulary": args.vocabulary,
+            "audio_source": args.audio_source, "duplicate_echoes_removed": duplicates,
+            "speaker_classification": "voice" if turns else "unavailable",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "low_confidence_segments": sum(
+                item.avg_logprob is not None and item.avg_logprob < -1.0 for item in segments
+            ),
+            "backup_directory": str(backup.relative_to(session)) if backup else None,
+        }
+        (session / "transcription.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    if args.transcribe_only:
+        print(session / "transcript.md")
+        return 0
     if not transcript.strip():
         write_no_speech_minutes(session, manifest["title"])
         print(session / "minutes.md")
         return 0
+    progress("全文ログから議事録を作成中")
     summary, summary_model = ollama_summary(manifest["title"], transcript, args.ollama_model)
     if not summary.startswith("#"):
         summary = f"# {manifest['title']} — 議事録\n\n{summary}"

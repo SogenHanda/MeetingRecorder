@@ -1,2 +1,2 @@
-faster-whisper>=1.1
+faster-whisper>=1.2.1
 pyannote.audio>=3.3

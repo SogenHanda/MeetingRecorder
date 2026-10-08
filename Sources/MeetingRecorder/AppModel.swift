@@ -27,6 +27,15 @@ final class AppModel: ObservableObject {
     @Published var whisperModel: String {
         didSet { UserDefaults.standard.set(whisperModel, forKey: "whisperModel") }
     }
+    @Published var transcriptionLanguage: String {
+        didSet { UserDefaults.standard.set(transcriptionLanguage, forKey: "transcriptionLanguage") }
+    }
+    @Published var transcriptionVocabulary: String {
+        didSet { UserDefaults.standard.set(transcriptionVocabulary, forKey: "transcriptionVocabulary") }
+    }
+    @Published var transcriptionAudioSource: String {
+        didSet { UserDefaults.standard.set(transcriptionAudioSource, forKey: "transcriptionAudioSource") }
+    }
     @Published var ollamaModel: String {
         didSet { UserDefaults.standard.set(ollamaModel, forKey: "ollamaModel") }
     }
@@ -43,7 +52,10 @@ final class AppModel: ObservableObject {
     private var timer: Timer?
 
     init() {
-        whisperModel = UserDefaults.standard.string(forKey: "whisperModel") ?? "small"
+        whisperModel = UserDefaults.standard.string(forKey: "whisperModel") ?? "large-v3"
+        transcriptionLanguage = UserDefaults.standard.string(forKey: "transcriptionLanguage") ?? "ja"
+        transcriptionVocabulary = UserDefaults.standard.string(forKey: "transcriptionVocabulary") ?? ""
+        transcriptionAudioSource = UserDefaults.standard.string(forKey: "transcriptionAudioSource") ?? "separate"
         ollamaModel = UserDefaults.standard.string(forKey: "ollamaModel") ?? "qwen3.5:9b"
         huggingFaceToken = KeychainStore.load(account: "pyannote-token") ?? ""
         refreshDevices()
@@ -168,8 +180,8 @@ final class AppModel: ObservableObject {
         refreshSessions()
     }
 
-    func processSelectedSession() async {
-        guard let session = selectedSession, !isProcessing else { return }
+    func processSelectedSession(forceTranscription: Bool = false) async {
+        guard let session = selectedSession, !isProcessing, !isRecording else { return }
         isProcessing = true
         status = "文字起こし・話者分類中"
         do {
@@ -177,8 +189,16 @@ final class AppModel: ObservableObject {
                 sessionDirectory: session.directory,
                 whisperModel: whisperModel,
                 ollamaModel: ollamaModel,
-                huggingFaceToken: huggingFaceToken
+                huggingFaceToken: huggingFaceToken,
+                language: transcriptionLanguage,
+                vocabulary: transcriptionVocabulary,
+                audioSource: transcriptionAudioSource,
+                forceTranscription: forceTranscription,
+                onProgress: { [weak self] message in
+                    if self?.isProcessing == true { self?.status = message }
+                }
             )
+            refreshSessions()
             status = "議事録を作成しました"
         } catch {
             errorMessage = error.localizedDescription
@@ -202,6 +222,7 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func saveRename() -> Bool {
+        guard !isProcessing, !isRecording else { return false }
         let title = renameTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else {
             errorMessage = "名前を入力してください"
@@ -232,6 +253,7 @@ final class AppModel: ObservableObject {
     }
 
     func deletePreparedSession() {
+        guard !isProcessing, !isRecording else { return }
         guard let session = pendingDeleteSession else {
             isDeleteConfirmationPresented = false
             return

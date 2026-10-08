@@ -17,7 +17,7 @@ struct MeetingRecorderApp: App {
         Settings {
             SettingsView()
                 .environmentObject(model)
-                .frame(width: 520, height: 260)
+                .frame(width: 640, height: 510)
         }
     }
 }
