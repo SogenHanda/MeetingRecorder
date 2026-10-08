@@ -149,6 +149,10 @@ struct ContentView: View {
                     GridRow { Text("音声チャンク").foregroundStyle(.secondary); Text("\(session.manifest.chunks.count)個") }
                 }
 
+                if !session.manifest.chunks.isEmpty {
+                    RecordingPlaybackView(session: session, isRecording: model.isRecording)
+                }
+
                 HStack {
                     Button {
                         Task { await model.processSelectedSession() }
