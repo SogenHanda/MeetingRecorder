@@ -27,6 +27,9 @@ final class AppModel: ObservableObject {
     @Published var whisperModel: String {
         didSet { UserDefaults.standard.set(whisperModel, forKey: "whisperModel") }
     }
+    @Published var transcriptionEngine: String {
+        didSet { UserDefaults.standard.set(transcriptionEngine, forKey: "transcriptionEngine") }
+    }
     @Published var transcriptionLanguage: String {
         didSet { UserDefaults.standard.set(transcriptionLanguage, forKey: "transcriptionLanguage") }
     }
@@ -50,9 +53,15 @@ final class AppModel: ObservableObject {
     private var activeManifest: MeetingManifest?
     private var activeLedger: ActiveSessionLedger?
     private var timer: Timer?
+    private var processingWasCancelled = false
 
     init() {
         whisperModel = UserDefaults.standard.string(forKey: "whisperModel") ?? "large-v3"
+        #if arch(arm64)
+        transcriptionEngine = UserDefaults.standard.string(forKey: "transcriptionEngine") ?? "metal"
+        #else
+        transcriptionEngine = UserDefaults.standard.string(forKey: "transcriptionEngine") ?? "cpu"
+        #endif
         transcriptionLanguage = UserDefaults.standard.string(forKey: "transcriptionLanguage") ?? "ja"
         transcriptionVocabulary = UserDefaults.standard.string(forKey: "transcriptionVocabulary") ?? ""
         transcriptionAudioSource = UserDefaults.standard.string(forKey: "transcriptionAudioSource") ?? "separate"
@@ -183,11 +192,13 @@ final class AppModel: ObservableObject {
     func processSelectedSession(forceTranscription: Bool = false) async {
         guard let session = selectedSession, !isProcessing, !isRecording else { return }
         isProcessing = true
+        processingWasCancelled = false
         status = "文字起こし・話者分類中"
         do {
             _ = try await ProcessingRunner.run(
                 sessionDirectory: session.directory,
                 whisperModel: whisperModel,
+                engine: transcriptionEngine,
                 ollamaModel: ollamaModel,
                 huggingFaceToken: huggingFaceToken,
                 language: transcriptionLanguage,
@@ -195,16 +206,27 @@ final class AppModel: ObservableObject {
                 audioSource: transcriptionAudioSource,
                 forceTranscription: forceTranscription,
                 onProgress: { [weak self] message in
-                    if self?.isProcessing == true { self?.status = message }
+                    if self?.isProcessing == true, self?.processingWasCancelled == false { self?.status = message }
                 }
             )
             refreshSessions()
             status = "議事録を作成しました"
         } catch {
-            errorMessage = error.localizedDescription
-            status = "処理に失敗しました"
+            if processingWasCancelled {
+                status = "文字起こし処理を中止しました"
+            } else {
+                errorMessage = error.localizedDescription
+                status = "処理に失敗しました"
+            }
         }
         isProcessing = false
+    }
+
+    func cancelProcessing() {
+        guard isProcessing else { return }
+        processingWasCancelled = true
+        status = "文字起こし処理を中止しています"
+        ProcessingRunner.cancel()
     }
 
     func revealSelectedSession() {

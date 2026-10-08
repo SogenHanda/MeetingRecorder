@@ -6,8 +6,12 @@ struct ProcessingResult: Sendable {
 }
 
 enum ProcessingRunner {
+    private static let activeProcess = ProcessingProcessSlot()
+
+    static func cancel() { activeProcess.cancel() }
+
     static func run(
-        sessionDirectory: URL, whisperModel: String, ollamaModel: String, huggingFaceToken: String,
+        sessionDirectory: URL, whisperModel: String, engine: String, ollamaModel: String, huggingFaceToken: String,
         language: String, vocabulary: String, audioSource: String, forceTranscription: Bool,
         onProgress: @escaping @MainActor @Sendable (String) -> Void
     ) async throws -> ProcessingResult {
@@ -32,6 +36,7 @@ enum ProcessingRunner {
                 script.path,
                 "--session", sessionDirectory.path,
                 "--model", whisperModel,
+                "--engine", engine,
                 "--ollama-model", ollamaModel,
                 "--language", language,
                 "--vocabulary", String(vocabulary.prefix(1000)),
@@ -59,6 +64,7 @@ enum ProcessingRunner {
                 }
             }
             process.terminationHandler = { process in
+                activeProcess.clear(process)
                 output.fileHandleForReading.readabilityHandler = nil
                 let data = output.fileHandleForReading.readDataToEndOfFile()
                 _ = logBuffer.append(data)
@@ -77,12 +83,38 @@ enum ProcessingRunner {
                 }
             }
             do {
+                activeProcess.set(process)
                 try process.run()
             } catch {
+                activeProcess.clear(process)
                 output.fileHandleForReading.readabilityHandler = nil
                 continuation.resume(throwing: error)
             }
         }
+    }
+}
+
+private final class ProcessingProcessSlot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+
+    func set(_ value: Process) {
+        lock.lock()
+        defer { lock.unlock() }
+        process = value
+    }
+
+    func clear(_ value: Process) {
+        lock.lock()
+        defer { lock.unlock() }
+        if process === value { process = nil }
+    }
+
+    func cancel() {
+        lock.lock()
+        let active = process
+        lock.unlock()
+        if let active, active.isRunning { active.terminate() }
     }
 }
 

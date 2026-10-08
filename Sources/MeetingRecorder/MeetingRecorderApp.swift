@@ -17,7 +17,7 @@ struct MeetingRecorderApp: App {
         Settings {
             SettingsView()
                 .environmentObject(model)
-                .frame(width: 640, height: 510)
+                .frame(width: 640, height: 600)
         }
     }
 }
@@ -26,7 +26,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let model, model.isRecording else { return .terminateNow }
+        guard let model else { return .terminateNow }
+        if model.isProcessing { model.cancelProcessing() }
+        guard model.isRecording else { return .terminateNow }
         Task { @MainActor in
             await model.stopRecording()
             sender.reply(toApplicationShouldTerminate: true)

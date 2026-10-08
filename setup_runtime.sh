@@ -22,4 +22,7 @@ mkdir -p "$runtime_root"
 "$python_command" -m venv "$runtime_root/.venv"
 "$runtime_root/.venv/bin/python3" -m pip install --upgrade pip
 "$runtime_root/.venv/bin/python3" -m pip install -r "${0:A:h}/requirements.txt"
+if [[ "$(uname -m)" == "arm64" ]]; then
+  "${0:A:h}/setup_gpu_runtime.sh"
+fi
 print "ローカル音声処理ランタイムを作成しました: $runtime_root/.venv"

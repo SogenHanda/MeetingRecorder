@@ -165,6 +165,9 @@ struct ContentView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(model.isProcessing || model.isRecording || session.manifest.chunks.isEmpty)
+                    if model.isProcessing {
+                        Button("処理を中止", action: model.cancelProcessing)
+                    }
 
                     if FileManager.default.fileExists(atPath: session.transcriptURL.path) {
                         Button("文字起こしをやり直す") {
@@ -208,6 +211,12 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Picker("文字起こしエンジン", selection: $model.transcriptionEngine) {
+                Text("Metal GPU（Apple Silicon・推奨）").tag("metal")
+                Text("CPU（従来方式）").tag("cpu")
+            }
+            Text("GPU版はwhisper.cppを使用します。GPUを使えない場合は明示的にエラーを表示します。映像ソフトとGPU負荷を共有するため、必要ならCPUへ切り替えられます。")
+                .font(.caption).foregroundStyle(.secondary)
             TextField("Whisperモデル", text: $model.whisperModel)
             Text("精度優先: large-v3。速度とのバランス: large-v3-turbo。初回はモデルをダウンロードします。")
                 .font(.caption).foregroundStyle(.secondary)

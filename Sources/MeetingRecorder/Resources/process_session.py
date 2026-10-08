@@ -6,10 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 import wave
@@ -123,7 +127,57 @@ def build_mix(session: Path, sources: dict[str, Path]) -> Path:
     return mixed
 
 
-def load_whisper_model(model_name: str):
+@dataclass
+class MetalWhisperModel:
+    executable: Path
+    model_path: Path
+    vad_path: Path
+    verified: bool = False
+
+
+def find_whisper_cli() -> Path:
+    runtime = Path.home() / "Library/Application Support/MeetingRecorder/runtime/bin/whisper-cli"
+    candidates = [runtime, Path("/opt/homebrew/bin/whisper-cli"), Path("/usr/local/bin/whisper-cli")]
+    discovered = shutil.which("whisper-cli")
+    if discovered:
+        candidates.append(Path(discovered))
+    for path in candidates:
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
+    raise RuntimeError("Metal GPU用ランタイムがありません。プロジェクト内の ./setup_gpu_runtime.sh を実行してください。")
+
+
+def cached_gpu_file(repository: str, filename: str) -> Path:
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+    try:
+        return Path(hf_hub_download(repository, filename, local_files_only=True))
+    except LocalEntryNotFoundError:
+        progress(f"GPU用モデルを初回ダウンロード中: {filename}")
+        return Path(hf_hub_download(repository, filename))
+
+
+def load_metal_model(model_name: str) -> MetalWhisperModel:
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        raise RuntimeError("Metal GPU版はApple SiliconのMacが必要です。設定でCPUを選択すると従来方式を使用できます。")
+    executable = find_whisper_cli()
+    local_path = Path(model_name).expanduser()
+    if local_path.is_file():
+        model_path = local_path.resolve()
+    else:
+        supported = {"tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en",
+                     "large-v1", "large-v2", "large-v3", "large-v3-turbo"}
+        if model_name not in supported:
+            raise RuntimeError("GPU版では large-v3 / large-v3-turbo などのモデル名、またはGGML .binファイルのパスを指定してください。")
+        # Full F16 model: do not silently trade recognition quality for quantization.
+        model_path = cached_gpu_file("ggerganov/whisper.cpp", f"ggml-{model_name}.bin")
+    vad_path = cached_gpu_file("ggml-org/whisper-vad", "ggml-silero-v6.2.0.bin")
+    return MetalWhisperModel(executable, model_path, vad_path)
+
+
+def load_whisper_model(model_name: str, engine: str = "metal"):
+    if engine == "metal":
+        return load_metal_model(model_name)
     try:
         from faster_whisper import WhisperModel
         from faster_whisper.utils import download_model
@@ -145,6 +199,8 @@ def load_whisper_model(model_name: str):
 
 
 def transcribe(audio: Path, model, language: str, vocabulary: str, source: str) -> tuple[list[SpeechSegment], str]:
+    if isinstance(model, MetalWhisperModel):
+        return transcribe_metal(audio, model, language, vocabulary, source)
     segments, info = model.transcribe(
         str(audio), language=None if language == "auto" else language,
         multilingual=language == "auto",
@@ -167,6 +223,107 @@ def transcribe(audio: Path, model, language: str, vocabulary: str, source: str) 
             progress(f"{source_name(source)}を文字起こし中 {timestamp(item.end)} / {timestamp(info.duration)}")
             last_reported = item.end
     return result, info.language or "unknown"
+
+
+def parse_metal_segments(payload: dict, source: str, offset: float = 0) -> list[SpeechSegment]:
+    result = []
+    for item in payload["transcription"]:
+        text = item["text"].strip()
+        if not text:
+            continue
+        result.append(SpeechSegment(
+            offset + item["offsets"]["from"] / 1000,
+            offset + item["offsets"]["to"] / 1000,
+            text, audio_source=source,
+        ))
+    return result
+
+
+def run_metal_window(command: list[str], output: Path, model: MetalWhisperModel,
+                     source: str, completed: float, window_duration: float, total: float) -> dict:
+    # Drain output continuously, but do not expose recognized private text in UI logs.
+    tail = ""
+    gpu_selected = False
+    gpu_weights = False
+    gpu_failed = False
+    with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                          text=True, encoding="utf-8", errors="replace") as process:
+        def stop_child(signum, frame):
+            process.terminate()
+            raise SystemExit(128 + signum)
+
+        previous_handlers = {signum: signal.signal(signum, stop_child) for signum in (signal.SIGTERM, signal.SIGINT)}
+        try:
+            for line in process.stderr:
+                tail = (tail + line)[-16000:]
+                if re.search(r"whisper_backend_init_gpu: using (?:Metal|MTL)\d* backend", line):
+                    gpu_selected = True
+                if re.search(r"whisper_model_load:.*(?:Metal|MTL)\d*.*total size\s*=\s*[1-9][\d.]* MB", line):
+                    gpu_weights = True
+                if re.search(r"failed to initialize (?:Metal|MTL)\d* backend", line):
+                    gpu_failed = True
+                match = re.search(r"progress\s*=\s*(\d+)%", line)
+                if match:
+                    position = min(total, completed + window_duration * int(match[1]) / 100)
+                    progress(f"{source_name(source)}をGPUで文字起こし中 {timestamp(position)} / {timestamp(total)}")
+            code = process.wait()
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+    if code != 0:
+        raise RuntimeError(f"Metal GPU文字起こしに失敗しました（終了コード {code}）:\n{tail}")
+    if not (gpu_selected and gpu_weights) or gpu_failed:
+        raise RuntimeError(f"Metal GPUが使用されませんでした。CPUへ自動的には切り替えません。./setup_gpu_runtime.sh を再実行してください。\n{tail}")
+    model.verified = True
+    if not output.is_file():
+        raise RuntimeError(f"GPU認識結果が作成されませんでした。言語・モデルの設定を確認してください。\n{tail}")
+    with output.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def transcribe_metal(audio: Path, model: MetalWhisperModel, language: str,
+                     vocabulary: str, source: str) -> tuple[list[SpeechSegment], str]:
+    result: list[SpeechSegment] = []
+    languages: list[str] = []
+    # Bound decoding memory for long meetings. Overlap provides context at boundaries;
+    # each segment belongs to exactly one window according to its midpoint.
+    window_seconds = 600
+    context_seconds = 10
+    with wave.open(str(audio), "rb") as original, tempfile.TemporaryDirectory(prefix="metal-", dir=audio.parent) as folder:
+        rate = original.getframerate()
+        total_frames = original.getnframes()
+        total = total_frames / rate
+        for core_start_frame in range(0, total_frames, window_seconds * rate):
+            core_end_frame = min(total_frames, core_start_frame + window_seconds * rate)
+            start_frame = max(0, core_start_frame - context_seconds * rate)
+            end_frame = min(total_frames, core_end_frame + context_seconds * rate)
+            window = Path(folder) / "window.wav"
+            output_base = Path(folder) / "result"
+            output = output_base.with_suffix(".json")
+            if output.exists():
+                output.unlink()
+            original.setpos(start_frame)
+            with wave.open(str(window), "wb") as chunk:
+                chunk.setparams(original.getparams())
+                chunk.writeframes(original.readframes(end_frame - start_frame))
+            progress(f"{source_name(source)}をMetal GPUで文字起こし中 {timestamp(core_start_frame / rate)} / {timestamp(total)}")
+            command = [
+                str(model.executable), "--model", str(model.model_path), "--file", str(window),
+                "--language", language, "--beam-size", "5", "--best-of", "5", "--threads", "4",
+                "--flash-attn", "--vad", "--vad-model", str(model.vad_path),
+                "--vad-min-silence-duration-ms", "600", "--vad-speech-pad-ms", "400",
+                "--output-json-full", "--output-file", str(output_base), "--print-progress", "--suppress-nst",
+            ]
+            if vocabulary.strip():
+                command.extend(["--prompt", vocabulary.strip(), "--carry-initial-prompt"])
+            payload = run_metal_window(command, output, model, source,
+                                       start_frame / rate, (end_frame - start_frame) / rate, total)
+            languages.append(payload.get("result", {}).get("language", "unknown"))
+            for item in parse_metal_segments(payload, source, start_frame / rate):
+                midpoint = (item.start + item.end) / 2
+                if core_start_frame / rate <= midpoint < core_end_frame / rate:
+                    result.append(item)
+    return result, ", ".join(dict.fromkeys(languages)) or language
 
 
 def merge_sources(segments: list[SpeechSegment]) -> tuple[list[SpeechSegment], int]:
@@ -639,8 +796,10 @@ def ollama_summary(title: str, transcript: str, requested_model: str) -> tuple[s
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--session", required=True)
+    parser.add_argument("--session")
     parser.add_argument("--model", default="large-v3")
+    parser.add_argument("--engine", choices=("metal", "cpu"), default="metal")
+    parser.add_argument("--prepare-gpu", action="store_true")
     parser.add_argument("--ollama-model", default="")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--summary-only", action="store_true")
@@ -650,6 +809,13 @@ def main() -> int:
     parser.add_argument("--vocabulary", default="")
     parser.add_argument("--audio-source", choices=("separate", "mixed", "microphone", "system"), default="separate")
     args = parser.parse_args()
+
+    if args.prepare_gpu:
+        load_metal_model(args.model)
+        print("GPU用モデルの準備が完了しました。")
+        return 0
+    if not args.session:
+        parser.error("--session が必要です")
 
     session = Path(args.session).resolve()
     manifest = read_manifest(session)
@@ -663,7 +829,8 @@ def main() -> int:
         transcript = plain_transcript(segments)
     else:
         sources = build_audio_sources(session, manifest, args.audio_source)
-        model = load_whisper_model(args.model)
+        started_processing = time.monotonic()
+        model = load_whisper_model(args.model, args.engine)
         raw_segments: list[SpeechSegment] = []
         languages: list[str] = []
         inputs = {"mixed": build_mix(session, sources)} if args.audio_source == "mixed" else sources
@@ -671,6 +838,7 @@ def main() -> int:
             source_segments, detected_language = transcribe(audio, model, args.language, args.vocabulary, source)
             raw_segments.extend(source_segments)
             languages.append(detected_language)
+        gpu_verified = isinstance(model, MetalWhisperModel) and model.verified
         del model
         segments, duplicates = merge_sources(raw_segments)
         progress("声ごとの話者を分類中")
@@ -686,11 +854,15 @@ def main() -> int:
         )
         metadata = {
             "model": args.model, "requested_language": args.language,
+            "engine": "whisper.cpp" if args.engine == "metal" else "faster-whisper",
+            "device": "metal" if gpu_verified else "cpu",
+            "gpu_verified": gpu_verified,
+            "recognition_seconds": round(time.monotonic() - started_processing, 2),
             "detected_languages": languages, "vocabulary": args.vocabulary,
             "audio_source": args.audio_source, "duplicate_echoes_removed": duplicates,
             "speaker_classification": "voice" if turns else "unavailable",
             "completed_at": datetime.now(timezone.utc).isoformat(),
-            "low_confidence_segments": sum(
+            "low_confidence_segments": None if args.engine == "metal" else sum(
                 item.avg_logprob is not None and item.avg_logprob < -1.0 for item in segments
             ),
             "backup_directory": str(backup.relative_to(session)) if backup else None,
